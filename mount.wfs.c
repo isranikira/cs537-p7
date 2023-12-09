@@ -20,6 +20,22 @@ static char *mapped_mem = NULL;
 
 // Filesystem methods
 
+//get the indoe number by searching through all the inodes and returning the highest inode found + 1
+unsigned long new_inode_number()
+{
+    unsigned long new_inode = 0;
+    char *curr_mmap_loc = mapped_mem + sizeof(struct wfs_sb);
+    while(curr_mmap_loc < mapped_mem + ((struct wfs_sb *)mapped_mem)->head)
+    {
+        struct wfs_inode inode_comp = ((struct wfs_log_entry*)curr_mmap_loc)->inode;
+        if(inode_comp.inode_number > new_inode && inode_comp.deleted == 0)
+        {
+            new_inode = inode_comp.inode_number;
+        }
+        curr_mmap_loc = curr_mmap_loc + sizeof(struct wfs_inode) + inode_comp.size;
+    }
+    return new_inode + 1;
+}
 //have a global var for the size of the superblock
 //have a global void pointer for where you are currently in the mmap
 //attach the mmap very similar to how you do it in the mkfs file 
@@ -76,7 +92,7 @@ struct wfs_log_entry *get_log_entry(const char *path)
         //now need to find next inode to look for or return the log entry if its the last one
         //do this by starting at the location of data and parsing through how many entries there are
         struct wfs_dentry *curr_dentry = (struct wfs_dentry *)entry_match->data;
-        int data_offset = 0;
+        int data_offset = sizeof(struct wfs_inode); //the size if the wfs_inode struct plus data structs
         while(data_offset < entry_match->inode.size)
         {
             if(strcmp(curr_dentry->name, token) == 0)
@@ -122,6 +138,83 @@ static int wfs_getattr(const char *path, struct stat *stbuf)
 // Create an empty file
 static int wfs_mknod(const char* path, mode_t mode, dev_t rdev)
 {
+    //do this one first
+    /*  Find the parent log_entry 
+     *  - send the path of the parent which would be the path minus the last "token"
+     *  - if its null throw an error
+     *  generate a new inode number for the file entry
+     * initialize log entry with the necessary data and the dentry struct
+     * need to make the parents dir deleded then add the add the updated ddata struct and size to next availible addr
+     * add the new log entry to the file mem
+     * update the head of the superblock
+    */
+    const char *lastSlash = strrchr(path, '/');
+    char *parent_dir = NULL;
+    char *child_file_name = NULL;
+    if (lastSlash != NULL) {
+        //for the parent
+        size_t length_parent = lastSlash - path;
+        strncpy(parent_dir, path, length_parent);
+        parent_dir[length_parent] = '\0';
+        //for the child
+        size_t length_child = strlen(lastSlash + 1);
+        strncpy(child_file_name, lastSlash + 1, length_child);
+        child_file_name[length_child] = '\0'; 
+    } 
+    else 
+    {
+        // If no '/' is found, the parent directory is the root directory
+        strcpy(parent_dir, "/");
+        strcpy(child_file_name, path);
+    }
+    struct wfs_log_entry *parent_log = get_log_entry(parent_dir);
+    if(parent_log == NULL)
+    {
+        return -ENOENT;
+    }
+    struct wfs_log_entry *child_log = get_log_entry(path);
+    if(child_log != NULL)
+    {
+        return -EEXIST;
+    }
+    unsigned long new_inode = new_inode_number();
+
+    //assign the new indode info
+    child_log->inode.inode_number = new_inode;
+    child_log->inode.deleted = 0;
+    child_log->inode.mode = mode;
+    child_log->inode.uid = getuid();
+    child_log->inode.gid = getgid();
+    child_log->inode.size = sizeof(struct wfs_log_entry);
+    child_log->inode.atime = time(NULL);
+    child_log->inode.mtime = time(NULL);
+    child_log->inode.ctime = time(NULL);
+    child_log->inode.links = 1;
+
+    //allocate new mem to the parent dir then update old deleted and new's data and size
+    struct wfs_log_entry *new_parent = (struct wfs_log_entry *)((char *)mapped_mem + ((struct wfs_sb *)mapped_mem)->head);
+    memcpy(new_parent, parent_log, parent_log->inode.size);
+
+    //change the head to the head plus the size of the parent log
+    ((struct wfs_sb *)mapped_mem)->head = (((struct wfs_sb *)mapped_mem)->head + parent_log->inode.size);
+    parent_log->inode.deleted = 1;
+    //increment the size by the dentry of the new file
+    new_parent->inode.size = new_parent->inode.size + sizeof(struct wfs_dentry);
+    //how do i update the data as an array
+    //with the new head create a dentry there
+    struct wfs_dentry *new_file_dentry = (struct wfs_dentry *)((char *)mapped_mem + ((struct wfs_sb *)mapped_mem)->head);
+    new_file_dentry->inode_number = new_inode;
+    strncpy(new_file_dentry->name, child_file_name, MAX_FILE_NAME_LEN - 1);
+    new_file_dentry->name[MAX_FILE_NAME_LEN - 1] = '\0';
+
+    //change the head to the head plus the size of the new dentry
+    ((struct wfs_sb *)mapped_mem)->head = ((struct wfs_sb *)mapped_mem)->head + sizeof(struct wfs_dentry);
+    //add the new log file
+    struct wfs_log_entry *new_child = (struct wfs_log_entry *)((char *)mapped_mem + ((struct wfs_sb *)mapped_mem)->head);
+    memcpy(new_child, child_log, child_log->inode.size);
+
+    //change the head to the head plus the size of the new dentry
+    ((struct wfs_sb *)mapped_mem)->head = ((struct wfs_sb *)mapped_mem)->head + sizeof(struct wfs_log_entry);
 
     return 0;
 }
@@ -129,7 +222,8 @@ static int wfs_mknod(const char* path, mode_t mode, dev_t rdev)
 // Create an empty directory
 static int wfs_mkdir(const char* path, mode_t mode)
 {
-    return 0;
+    //make this one second
+    return wfs_mknod(path, __S_IFDIR | (mode & 0777), 0);
 }
 
 // Write to an existing file
@@ -146,7 +240,11 @@ static int wfs_write(const char *path, const char *buf, size_t size, off_t offse
 static int wfs_read(const char *path, char *buf, size_t size, off_t offset,
                     struct fuse_file_info *fi)
 {
-
+    struct wfs_log_entry *curr_entry = get_log_entry(path);
+    if(curr_entry == NULL)
+    {
+        return -ENOENT;
+    }
     return 0;
 }
 
