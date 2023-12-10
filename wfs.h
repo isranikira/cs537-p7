@@ -6,6 +6,11 @@
 
 #define MAX_FILE_NAME_LEN 32
 #define WFS_MAGIC 0xdeadbeef
+#define MAX_PATH_LEN 128
+
+#ifndef S_IFDIR
+#define S_IFDIR 0x41ed
+#endif
 
 struct wfs_sb {
     uint32_t magic;
